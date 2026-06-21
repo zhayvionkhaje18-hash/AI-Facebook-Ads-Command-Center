@@ -1,388 +1,253 @@
 /**
- * Meta/Facebook Ads API Client
- * Official Graph API integration
+ * Meta Marketing API Client
+ * Handles batch requests, rate limiting, and error retry logic
  */
 
-import { logger } from '../logger'
-import { retryWithBackoff, ExternalAPIError } from '../error-handler'
+interface RetryOptions {
+  maxRetries?: number
+  baseDelay?: number
+  maxDelay?: number
+}
 
-const META_API_VERSION = 'v19.0'
-const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
+interface BatchRequest {
+  method: 'GET' | 'POST' | 'DELETE' | 'PUT'
+  relative_url: string
+  body?: string
+}
 
-export interface MetaAPIResponse<T = any> {
-  data: T
-  paging?: {
-    cursors?: {
-      before: string
-      after: string
-    }
-    next?: string
-    previous?: string
-  }
-  error?: {
-    message: string
-    type: string
-    code: number
-    error_subcode?: number
-    fbtrace_id: string
-  }
+interface BatchResponse {
+  code: number
+  headers: Array<{ name: string; value: string }>
+  body: string
 }
 
 export class MetaAPIClient {
   private accessToken: string
+  private baseURL = 'https://graph.facebook.com/v18.0'
 
   constructor(accessToken: string) {
     this.accessToken = accessToken
   }
 
   /**
-   * Make authenticated request to Meta API
+   * Make a single API request with automatic retry on rate limits
    */
-  private async request<T>(
+  async request<T = any>(
     endpoint: string,
-    options: RequestInit = {}
-  ): Promise<MetaAPIResponse<T>> {
-    const url = endpoint.startsWith('http') ? endpoint : `${META_API_BASE}${endpoint}`
+    options: {
+      method?: 'GET' | 'POST' | 'DELETE' | 'PUT'
+      params?: Record<string, any>
+      body?: any
+      retry?: RetryOptions
+    } = {}
+  ): Promise<T> {
+    const {
+      method = 'GET',
+      params = {},
+      body,
+      retry = { maxRetries: 3, baseDelay: 1000, maxDelay: 10000 }
+    } = options
 
-    return retryWithBackoff(
-      async () => {
-        logger.debug('Meta API request', { endpoint, method: options.method || 'GET' })
+    // Build URL with access token and params
+    const url = new URL(`${this.baseURL}${endpoint}`)
+    url.searchParams.set('access_token', this.accessToken)
+    
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) {
+        url.searchParams.set(key, String(value))
+      }
+    })
 
-        const response = await fetch(url, {
-          ...options,
-          headers: {
-            'Content-Type': 'application/json',
-            ...options.headers,
-          },
+    let lastError: Error | null = null
+    let attempt = 0
+
+    while (attempt <= (retry.maxRetries || 0)) {
+      try {
+        const response = await fetch(url.toString(), {
+          method,
+          headers: body ? { 'Content-Type': 'application/json' } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
         })
 
         const data = await response.json()
 
-        if (!response.ok || data.error) {
-          const error = data.error || {}
-          throw new ExternalAPIError(
-            'Meta API',
-            error.message || 'API request failed',
-            {
-              code: error.code,
-              type: error.type,
-              subcode: error.error_subcode,
-              trace: error.fbtrace_id,
-              status: response.status,
-            }
-          )
+        // Handle Meta API errors
+        if (data.error) {
+          const error = data.error
+
+          // Rate limit - retry with exponential backoff
+          if (error.code === 4 || error.code === 17 || error.code === 32) {
+            const delay = Math.min(
+              retry.baseDelay! * Math.pow(2, attempt),
+              retry.maxDelay!
+            )
+            
+            console.warn(`Rate limited. Retrying in ${delay}ms... (attempt ${attempt + 1}/${retry.maxRetries! + 1})`)
+            
+            await this.sleep(delay)
+            attempt++
+            continue
+          }
+
+          // OAuth/Permission errors - don't retry
+          if (error.code === 190 || error.code === 102 || error.code === 10) {
+            throw new Error(`Auth error: ${error.message}`)
+          }
+
+          // Temporary errors - retry
+          if (error.code === 1 || error.code === 2) {
+            const delay = Math.min(
+              retry.baseDelay! * Math.pow(2, attempt),
+              retry.maxDelay!
+            )
+            
+            console.warn(`Temporary error. Retrying in ${delay}ms...`)
+            await this.sleep(delay)
+            attempt++
+            continue
+          }
+
+          // Other errors - throw
+          throw new Error(`Meta API error: ${error.message} (code: ${error.code})`)
         }
 
-        return data
-      },
-      {
-        maxAttempts: 3,
-        initialDelay: 1000,
-        onRetry: (attempt, error) => {
-          logger.warn('Meta API retry', { attempt, error: error.message, endpoint })
-        },
+        return data as T
+      } catch (error) {
+        lastError = error as Error
+        
+        // Network errors - retry
+        if (attempt < (retry.maxRetries || 0)) {
+          const delay = Math.min(
+            retry.baseDelay! * Math.pow(2, attempt),
+            retry.maxDelay!
+          )
+          
+          console.warn(`Request failed. Retrying in ${delay}ms...`, error)
+          await this.sleep(delay)
+          attempt++
+          continue
+        }
+        
+        break
       }
-    )
+    }
+
+    throw lastError || new Error('Request failed after retries')
   }
 
   /**
-   * Get current user info
+   * Execute multiple requests in a single batch
+   * Up to 50 requests per batch
    */
-  async getMe(fields: string[] = ['id', 'name', 'email']): Promise<any> {
-    const response = await this.request(
-      `/me?fields=${fields.join(',')}&access_token=${this.accessToken}`
-    )
-    return response.data || response
+  async batch<T = any>(requests: BatchRequest[]): Promise<Array<T | Error>> {
+    if (requests.length === 0) {
+      return []
+    }
+
+    if (requests.length > 50) {
+      throw new Error('Batch size cannot exceed 50 requests')
+    }
+
+    const batchPayload = requests.map(req => ({
+      method: req.method,
+      relative_url: req.relative_url,
+      ...(req.body && { body: req.body })
+    }))
+
+    try {
+      const response = await this.request<BatchResponse[]>('/', {
+        method: 'POST',
+        params: {
+          batch: JSON.stringify(batchPayload)
+        }
+      })
+
+      // Parse batch responses
+      return response.map((res, index) => {
+        try {
+          if (res.code >= 200 && res.code < 300) {
+            return JSON.parse(res.body) as T
+          } else {
+            const errorBody = JSON.parse(res.body)
+            return new Error(errorBody.error?.message || `Request ${index} failed with code ${res.code}`)
+          }
+        } catch (e) {
+          return new Error(`Failed to parse response for request ${index}`)
+        }
+      })
+    } catch (error) {
+      // If batch request itself fails, return errors for all
+      return requests.map(() => error as Error)
+    }
   }
 
   /**
-   * Get user's business managers
+   * Execute batches with automatic chunking
+   * Splits large request arrays into chunks of 50
    */
-  async getBusinessManagers(): Promise<any[]> {
-    const response = await this.request<any[]>(
-      `/me/businesses?fields=id,name,profile_picture_uri&access_token=${this.accessToken}`
-    )
-    return response.data || []
-  }
-
-  /**
-   * Get ad accounts for a business manager
-   */
-  async getAdAccounts(businessId?: string): Promise<any[]> {
-    const endpoint = businessId
-      ? `/${businessId}/adaccounts`
-      : '/me/adaccounts'
-
-    const fields = [
-      'id',
-      'name',
-      'account_status',
-      'currency',
-      'timezone_name',
-      'amount_spent',
-      'balance',
-    ]
-
-    const response = await this.request<any[]>(
-      `${endpoint}?fields=${fields.join(',')}&access_token=${this.accessToken}`
-    )
-
-    return response.data || []
-  }
-
-  /**
-   * Get campaigns for an ad account
-   */
-  async getCampaigns(adAccountId: string, params: {
-    limit?: number
-    after?: string
-    fields?: string[]
-  } = {}): Promise<MetaAPIResponse<any[]>> {
-    const {
-      limit = 100,
-      after,
-      fields = [
-        'id',
-        'name',
-        'objective',
-        'status',
-        'effective_status',
-        'buying_type',
-        'budget_remaining',
-        'daily_budget',
-        'lifetime_budget',
-        'start_time',
-        'stop_time',
-        'created_time',
-        'updated_time',
-      ],
-    } = params
-
-    let url = `/${adAccountId}/campaigns?fields=${fields.join(',')}&limit=${limit}&access_token=${this.accessToken}`
+  async batchAll<T = any>(requests: BatchRequest[]): Promise<Array<T | Error>> {
+    const chunks: BatchRequest[][] = []
     
-    if (after) {
-      url += `&after=${after}`
+    for (let i = 0; i < requests.length; i += 50) {
+      chunks.push(requests.slice(i, i + 50))
     }
 
-    return this.request<any[]>(url)
+    const results: Array<T | Error> = []
+
+    for (const chunk of chunks) {
+      const chunkResults = await this.batch<T>(chunk)
+      results.push(...chunkResults)
+    }
+
+    return results
   }
 
   /**
-   * Get ad sets for a campaign
+   * Get paginated results automatically
    */
-  async getAdSets(campaignId: string, params: {
-    limit?: number
-    after?: string
-  } = {}): Promise<MetaAPIResponse<any[]>> {
-    const { limit = 100, after } = params
+  async *paginate<T = any>(
+    endpoint: string,
+    params: Record<string, any> = {},
+    limit = 100
+  ): AsyncGenerator<T[], void, unknown> {
+    let nextUrl: string | null = endpoint
+    let hasMore = true
 
-    const fields = [
-      'id',
-      'name',
-      'campaign_id',
-      'status',
-      'effective_status',
-      'optimization_goal',
-      'billing_event',
-      'bid_strategy',
-      'daily_budget',
-      'lifetime_budget',
-      'targeting',
-      'start_time',
-      'end_time',
-    ]
+    while (hasMore && nextUrl) {
+      const response = await this.request<{
+        data: T[]
+        paging?: { next?: string; cursors?: { after?: string } }
+      }>(nextUrl, {
+        params: { ...params, limit }
+      })
 
-    let url = `/${campaignId}/adsets?fields=${fields.join(',')}&limit=${limit}&access_token=${this.accessToken}`
-    
-    if (after) {
-      url += `&after=${after}`
+      if (response.data && response.data.length > 0) {
+        yield response.data
+      }
+
+      // Check for pagination
+      if (response.paging?.next) {
+        // Extract relative URL from full URL
+        const url = new URL(response.paging.next)
+        nextUrl = url.pathname + url.search
+        nextUrl = nextUrl.replace(/\/v\d+\.\d+/, '') // Remove version from path
+      } else {
+        hasMore = false
+      }
     }
-
-    return this.request<any[]>(url)
   }
 
   /**
-   * Get ads for an ad set
+   * Helper: Sleep utility
    */
-  async getAds(adSetId: string, params: {
-    limit?: number
-    after?: string
-  } = {}): Promise<MetaAPIResponse<any[]>> {
-    const { limit = 100, after } = params
-
-    const fields = [
-      'id',
-      'name',
-      'adset_id',
-      'campaign_id',
-      'status',
-      'effective_status',
-      'creative',
-    ]
-
-    let url = `/${adSetId}/ads?fields=${fields.join(',')}&limit=${limit}&access_token=${this.accessToken}`
-    
-    if (after) {
-      url += `&after=${after}`
-    }
-
-    return this.request<any[]>(url)
-  }
-
-  /**
-   * Get insights for an entity (account, campaign, adset, ad)
-   */
-  async getInsights(entityId: string, params: {
-    datePreset?: 'today' | 'yesterday' | 'last_7d' | 'last_30d' | 'lifetime'
-    timeRange?: { since: string; until: string }
-    level?: 'account' | 'campaign' | 'adset' | 'ad'
-    limit?: number
-    after?: string
-  } = {}): Promise<MetaAPIResponse<any[]>> {
-    const {
-      datePreset = 'last_30d',
-      timeRange,
-      level,
-      limit = 100,
-      after,
-    } = params
-
-    const fields = [
-      'impressions',
-      'clicks',
-      'unique_clicks',
-      'spend',
-      'reach',
-      'frequency',
-      'cpm',
-      'cpc',
-      'ctr',
-      'actions',
-      'action_values',
-      'purchase_roas',
-      'cost_per_action_type',
-    ]
-
-    let url = `/${entityId}/insights?fields=${fields.join(',')}&limit=${limit}&access_token=${this.accessToken}`
-
-    if (datePreset && !timeRange) {
-      url += `&date_preset=${datePreset}`
-    }
-
-    if (timeRange) {
-      url += `&time_range=${JSON.stringify(timeRange)}`
-    }
-
-    if (level) {
-      url += `&level=${level}`
-    }
-
-    if (after) {
-      url += `&after=${after}`
-    }
-
-    return this.request<any[]>(url)
-  }
-
-  /**
-   * Get daily insights with date breakdown
-   */
-  async getDailyInsights(entityId: string, params: {
-    since: string // YYYY-MM-DD
-    until: string // YYYY-MM-DD
-  }): Promise<MetaAPIResponse<any[]>> {
-    const { since, until } = params
-
-    const fields = [
-      'date_start',
-      'date_stop',
-      'impressions',
-      'clicks',
-      'unique_clicks',
-      'spend',
-      'reach',
-      'frequency',
-      'cpm',
-      'cpc',
-      'ctr',
-      'actions',
-      'action_values',
-      'purchase_roas',
-    ]
-
-    const url = `/${entityId}/insights?fields=${fields.join(',')}&time_range=${JSON.stringify({ since, until })}&time_increment=1&access_token=${this.accessToken}`
-
-    return this.request<any[]>(url)
-  }
-
-  /**
-   * Batch request for multiple API calls
-   */
-  async batch(requests: Array<{ method: string; relative_url: string }>): Promise<any[]> {
-    const response = await fetch(`${META_API_BASE}?access_token=${this.accessToken}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        batch: requests,
-      }),
-    })
-
-    const data = await response.json()
-
-    if (!response.ok) {
-      throw new ExternalAPIError('Meta API', 'Batch request failed', data)
-    }
-
-    return data
-  }
-
-  /**
-   * Check token validity
-   */
-  async debugToken(): Promise<any> {
-    const response = await this.request(
-      `/debug_token?input_token=${this.accessToken}&access_token=${this.accessToken}`
-    )
-    return response.data
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
   }
 }
 
 /**
- * Helper to extract actions from insights
+ * Create a new Meta API client instance
  */
-export function extractAction(actions: any[], actionType: string): number {
-  if (!actions || !Array.isArray(actions)) return 0
-  const action = actions.find(a => a.action_type === actionType)
-  return action ? parseFloat(action.value) : 0
+export function createMetaClient(accessToken: string): MetaAPIClient {
+  return new MetaAPIClient(accessToken)
 }
-
-/**
- * Helper to extract action values (revenue)
- */
-export function extractActionValue(actionValues: any[], actionType: string): number {
-  if (!actionValues || !Array.isArray(actionValues)) return 0
-  const actionValue = actionValues.find(a => a.action_type === actionType)
-  return actionValue ? parseFloat(actionValue.value) : 0
-}
-
-/**
- * Calculate ROAS from insights
- */
-export function calculateROAS(insights: any): number {
-  const spend = parseFloat(insights.spend || 0)
-  const purchaseValue = extractActionValue(insights.action_values || [], 'purchase')
-  return spend > 0 ? purchaseValue / spend : 0
-}
-
-/**
- * Calculate CPA from insights
- */
-export function calculateCPA(insights: any, actionType: string = 'purchase'): number {
-  const spend = parseFloat(insights.spend || 0)
-  const conversions = extractAction(insights.actions || [], actionType)
-  return conversions > 0 ? spend / conversions : 0
-}
-
-export default MetaAPIClient

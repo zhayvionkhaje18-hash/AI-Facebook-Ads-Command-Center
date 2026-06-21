@@ -1,5 +1,6 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { createMetaClient } from '@/lib/meta/api-client'
 
 export async function POST(request: Request) {
   const supabase = await createClient()
@@ -42,23 +43,22 @@ export async function POST(request: Request) {
 
   // Decrypt access token
   const accessToken = Buffer.from(connection.encrypted_access_token, 'base64').toString()
+  
+  // Create Meta API client with retry logic
+  const metaClient = createMetaClient(accessToken)
 
   try {
-    // Fetch ad accounts from Meta if not specified
     let adAccountIds: string[] = []
     
     if (adAccountId) {
       adAccountIds = [adAccountId]
     } else {
-      // Get all ad accounts for this user
-      const adAccountsResponse = await fetch(
-        `https://graph.facebook.com/v18.0/me/adaccounts?fields=id,name,account_status&access_token=${accessToken}`
-      )
-      const adAccountsData = await adAccountsResponse.json()
-
-      if (adAccountsData.error) {
-        throw new Error(adAccountsData.error.message || 'Failed to fetch ad accounts')
-      }
+      // Get all ad accounts using new client
+      const adAccountsData = await metaClient.request<{ data: any[] }>('/me/adaccounts', {
+        params: {
+          fields: 'id,name,account_status,currency'
+        }
+      })
 
       adAccountIds = adAccountsData.data?.map((acc: any) => acc.id) || []
       
@@ -71,98 +71,106 @@ export async function POST(request: Request) {
             account_id: account.id,
             account_name: account.name,
             account_status: account.account_status,
-            currency: 'USD', // Will be updated in detailed sync
+            currency: account.currency || 'USD',
           }, {
             onConflict: 'connection_id,account_id'
           })
       }
     }
 
-    // Sync campaigns for each ad account
     let totalCampaigns = 0
     let totalAdSets = 0
     let totalAds = 0
 
     for (const accountId of adAccountIds) {
-      // Sync Campaigns
+      // Build batch requests for efficient syncing
+      const batchRequests = []
+
       if (!entityType || entityType === 'all' || entityType === 'campaigns') {
-        const campaignsResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${accountId}/campaigns?fields=id,name,status,objective,daily_budget,lifetime_budget,created_time,updated_time&access_token=${accessToken}`
-        )
-        const campaignsData = await campaignsResponse.json()
-
-        if (!campaignsData.error && campaignsData.data) {
-          for (const campaign of campaignsData.data) {
-            await supabase
-              .from('campaigns')
-              .upsert({
-                connection_id: connectionId,
-                ad_account_id: accountId,
-                campaign_id: campaign.id,
-                campaign_name: campaign.name,
-                status: campaign.status,
-                objective: campaign.objective,
-                daily_budget: campaign.daily_budget,
-                lifetime_budget: campaign.lifetime_budget,
-              }, {
-                onConflict: 'connection_id,campaign_id'
-              })
-            totalCampaigns++
-          }
-        }
+        batchRequests.push({
+          method: 'GET' as const,
+          relative_url: `${accountId}/campaigns?fields=id,name,status,objective,daily_budget,lifetime_budget,created_time,updated_time&limit=100`
+        })
       }
 
-      // Sync Ad Sets
       if (!entityType || entityType === 'all' || entityType === 'adsets') {
-        const adsetsResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${accountId}/adsets?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,targeting,created_time,updated_time&access_token=${accessToken}`
-        )
-        const adsetsData = await adsetsResponse.json()
+        batchRequests.push({
+          method: 'GET' as const,
+          relative_url: `${accountId}/adsets?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,targeting,created_time,updated_time&limit=100`
+        })
+      }
 
-        if (!adsetsData.error && adsetsData.data) {
-          for (const adset of adsetsData.data) {
-            await supabase
-              .from('adsets')
-              .upsert({
-                connection_id: connectionId,
-                campaign_id: adset.campaign_id,
-                adset_id: adset.id,
-                adset_name: adset.name,
-                status: adset.status,
-                daily_budget: adset.daily_budget,
-                lifetime_budget: adset.lifetime_budget,
-                targeting: adset.targeting,
-              }, {
-                onConflict: 'connection_id,adset_id'
-              })
-            totalAdSets++
-          }
+      if (!entityType || entityType === 'all' || entityType === 'ads') {
+        batchRequests.push({
+          method: 'GET' as const,
+          relative_url: `${accountId}/ads?fields=id,name,status,adset_id,creative{id,title,body,image_url},created_time,updated_time&limit=100`
+        })
+      }
+
+      // Execute batch request
+      const batchResults = await metaClient.batch(batchRequests)
+
+      // Process campaigns
+      if (batchResults[0] && !(batchResults[0] instanceof Error)) {
+        const campaignsData = batchResults[0] as { data: any[] }
+        for (const campaign of campaignsData.data || []) {
+          await supabase
+            .from('campaigns')
+            .upsert({
+              connection_id: connectionId,
+              ad_account_id: accountId,
+              campaign_id: campaign.id,
+              campaign_name: campaign.name,
+              status: campaign.status,
+              objective: campaign.objective,
+              daily_budget: campaign.daily_budget,
+              lifetime_budget: campaign.lifetime_budget,
+            }, {
+              onConflict: 'connection_id,campaign_id'
+            })
+          totalCampaigns++
         }
       }
 
-      // Sync Ads
-      if (!entityType || entityType === 'all' || entityType === 'ads') {
-        const adsResponse = await fetch(
-          `https://graph.facebook.com/v18.0/${accountId}/ads?fields=id,name,status,adset_id,creative{id,title,body,image_url},created_time,updated_time&access_token=${accessToken}`
-        )
-        const adsData = await adsResponse.json()
+      // Process ad sets
+      if (batchResults[1] && !(batchResults[1] instanceof Error)) {
+        const adsetsData = batchResults[1] as { data: any[] }
+        for (const adset of adsetsData.data || []) {
+          await supabase
+            .from('adsets')
+            .upsert({
+              connection_id: connectionId,
+              campaign_id: adset.campaign_id,
+              adset_id: adset.id,
+              adset_name: adset.name,
+              status: adset.status,
+              daily_budget: adset.daily_budget,
+              lifetime_budget: adset.lifetime_budget,
+              targeting: adset.targeting,
+            }, {
+              onConflict: 'connection_id,adset_id'
+            })
+          totalAdSets++
+        }
+      }
 
-        if (!adsData.error && adsData.data) {
-          for (const ad of adsData.data) {
-            await supabase
-              .from('ads')
-              .upsert({
-                connection_id: connectionId,
-                adset_id: ad.adset_id,
-                ad_id: ad.id,
-                ad_name: ad.name,
-                status: ad.status,
-                creative: ad.creative,
-              }, {
-                onConflict: 'connection_id,ad_id'
-              })
-            totalAds++
-          }
+      // Process ads
+      if (batchResults[2] && !(batchResults[2] instanceof Error)) {
+        const adsData = batchResults[2] as { data: any[] }
+        for (const ad of adsData.data || []) {
+          await supabase
+            .from('ads')
+            .upsert({
+              connection_id: connectionId,
+              adset_id: ad.adset_id,
+              ad_id: ad.id,
+              ad_name: ad.name,
+              status: ad.status,
+              creative: ad.creative,
+            }, {
+              onConflict: 'connection_id,ad_id'
+            })
+          totalAds++
         }
       }
     }
