@@ -78,9 +78,11 @@ syncQueue.process('meta-sync', async (job: Job<SyncJobData>) => {
     // 5. Sync Business Managers (if full sync)
     if (syncType === 'full') {
       logger.info('Syncing business managers', { connectionId })
-      const businessManagers = await apiClient.getBusinessManagers()
+      const businessManagers = await apiClient.request<{ data: any[] }>('/me/businesses', {
+        params: { fields: 'id,name,profile_picture_uri' }
+      })
       
-      for (const bm of businessManagers) {
+      for (const bm of businessManagers.data || []) {
         await supabase.from('meta_business_managers').upsert({
           meta_connection_id: connectionId,
           business_manager_id: bm.id,
@@ -99,7 +101,12 @@ syncQueue.process('meta-sync', async (job: Job<SyncJobData>) => {
 
     // 6. Sync Ad Accounts
     logger.info('Syncing ad accounts', { connectionId })
-    const adAccounts = await apiClient.getAdAccounts()
+    const adAccountsResponse = await apiClient.request<{ data: any[] }>('/me/adaccounts', {
+      params: { 
+        fields: 'id,name,account_status,currency,timezone_name,amount_spent,balance'
+      }
+    })
+    const adAccounts = adAccountsResponse.data || []
     
     for (const account of adAccounts) {
       await supabase.from('meta_ad_accounts').upsert({
@@ -144,7 +151,16 @@ syncQueue.process('meta-sync', async (job: Job<SyncJobData>) => {
       let after: string | undefined
 
       while (hasMore) {
-        const response = await apiClient.getCampaigns(account.id, { after })
+        const response = await apiClient.request<{ 
+          data: any[]
+          paging?: { next?: string; cursors?: { after?: string } }
+        }>(`/${account.id}/campaigns`, {
+          params: {
+            fields: 'id,name,objective,status,effective_status,buying_type,budget_remaining,daily_budget,lifetime_budget,start_time,stop_time',
+            after
+          }
+        })
+        
         const campaigns = response.data || []
 
         for (const campaign of campaigns) {
@@ -200,9 +216,14 @@ syncQueue.process('meta-sync', async (job: Job<SyncJobData>) => {
         const campaign = campaignsToSync[i]
         
         try {
-          const insightsResponse = await apiClient.getDailyInsights(campaign.campaign_id, {
-            since,
-            until,
+          const insightsResponse = await apiClient.request<{
+            data: any[]
+          }>(`/${campaign.campaign_id}/insights`, {
+            params: {
+              fields: 'date_start,impressions,clicks,unique_clicks,spend,reach,frequency,cpm,cpc,ctr,actions,action_values',
+              time_range: JSON.stringify({ since, until }),
+              time_increment: 1
+            }
           })
 
           const insights = insightsResponse.data || []
