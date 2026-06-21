@@ -170,11 +170,23 @@ export async function POST(request: Request) {
           )
         ])
 
+        console.log(`Batch results for ${account.metaId}:`, {
+          totalBatches: batchResults.length,
+          errors: batchResults.filter(r => r instanceof Error).length,
+          successful: batchResults.filter(r => !(r instanceof Error)).length,
+        })
+
         let batchIndex = 0
 
         // Process campaigns
         if ((!entityType || entityType === 'all' || entityType === 'campaigns') && batchResults[batchIndex] && !(batchResults[batchIndex] instanceof Error)) {
           const campaignsData = batchResults[batchIndex] as { data: any[] }
+          console.log(`Raw campaigns data for ${account.metaId}:`, {
+            hasData: !!campaignsData.data,
+            count: campaignsData.data?.length || 0,
+            sample: campaignsData.data?.[0] || null
+          })
+          
           if (campaignsData.data && campaignsData.data.length > 0) {
             const campaignsToUpsert = campaignsData.data.map(campaign => ({
               meta_connection_id: connectionId,
@@ -340,6 +352,12 @@ export async function POST(request: Request) {
     }
 
     console.log(`Sync completed in ${durationSeconds}s: ${totalCampaigns} campaigns, ${totalAdSets} ad sets, ${totalAds} ads`)
+    console.log(`Ad accounts processed: ${accountsToProcess.length} of ${adAccountIds.length}`)
+    
+    // Log account IDs that were processed
+    accountsToProcess.forEach(acc => {
+      console.log(`Processed account: ${acc.metaId} (UUID: ${acc.uuid})`)
+    })
 
     return NextResponse.json({
       success: true,
@@ -351,7 +369,10 @@ export async function POST(request: Request) {
       },
       duration: durationSeconds,
       accountsProcessed: accountsToProcess.length,
-      totalAccounts: adAccountIds.length
+      totalAccounts: adAccountIds.length,
+      message: totalCampaigns + totalAdSets + totalAds === 0 
+        ? 'Sync completed but no data found. The ad accounts may not have any campaigns, ad sets, or ads yet.' 
+        : null
     })
 
   } catch (error: any) {
