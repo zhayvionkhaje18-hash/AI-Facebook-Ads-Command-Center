@@ -212,6 +212,15 @@ export default function AdAccountsPage() {
           <p className="text-slate-400 mb-6 max-w-md mx-auto">
             Connect your Facebook Business Manager from the workspace settings to start syncing ad data.
           </p>
+          {canManage && (
+            <a
+              href="/settings/workspace"
+              className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white font-medium px-6 py-3 rounded-lg transition-all"
+            >
+              <Shield className="w-5 h-5" />
+              Go to Workspace Settings
+            </a>
+          )}
         </div>
       ) : (
         <div className="grid lg:grid-cols-3 gap-6">

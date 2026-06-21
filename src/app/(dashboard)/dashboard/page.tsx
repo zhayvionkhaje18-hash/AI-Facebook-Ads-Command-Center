@@ -236,7 +236,7 @@ export default function DashboardPage() {
                 <Link2 className="w-12 h-12 text-slate-600 mx-auto mb-4" />
                 <p className="text-slate-400 mb-4">No Meta accounts connected</p>
                 <Link
-                  href="/ad-accounts"
+                  href="/settings/workspace"
                   className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white font-medium px-4 py-2.5 rounded-lg transition-all"
                 >
                   <Plus className="w-4 h-4" />
